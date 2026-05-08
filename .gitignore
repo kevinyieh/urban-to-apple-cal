@@ -1,0 +1,8 @@
+venv/
+.env
+__pycache__/
+*.html
+*.txt
+.DS_Store
+*.ics
+ms-playwright/

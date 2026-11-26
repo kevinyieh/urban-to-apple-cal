@@ -1,0 +1,57 @@
+name: Sync NY Urban Volleyball Schedule
+
+on:
+  schedule:
+    # Runs daily at 13:00 UTC (8:00 AM EST / 9:00 AM EDT)
+    - cron: "0 13 * * *"
+  workflow_dispatch:
+    inputs:
+      calendar_name:
+        description: "Optional calendar name override (defaults to CALENDAR_NAME repo variable or 'Em + Kev')"
+        required: false
+        type: string
+      dry_run:
+        description: "Preview changes without modifying your calendar"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: sync-ny-urban-schedule
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: playwright install --with-deps chromium
+
+      - name: Sync upcoming games to Apple Calendar (iCloud CalDAV)
+        env:
+          NY_URBAN_USERNAME: ${{ secrets.NY_URBAN_USERNAME }}
+          NY_URBAN_PASSWORD: ${{ secrets.NY_URBAN_PASSWORD }}
+          ICLOUD_USERNAME: ${{ secrets.ICLOUD_USERNAME }}
+          ICLOUD_APP_PASSWORD: ${{ secrets.ICLOUD_APP_PASSWORD }}
+          CALENDAR_NAME: ${{ inputs.calendar_name || vars.CALENDAR_NAME || secrets.CALENDAR_NAME || 'Em + Kev' }}
+        run: |
+          ARGS="--yes --backend icloud"
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          python main.py $ARGS

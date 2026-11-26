@@ -1,71 +1,77 @@
 # NY Urban Volleyball Calendar Sync
 
-Sync your NY Urban volleyball schedule directly to your Apple Calendar with physical gym addresses and team names.
+Sync your NY Urban volleyball schedule directly to your Apple Calendar with physical gym addresses, team names, automatic deduplication, and periodic GitHub Actions runs.
 
 ## Features
 
-- **Automated Login**: Securely logs into your `nyurban.com` account.
-- **Latest Season Detection**: Automatically finds your teams for the most recent season (e.g., Spring 2026).
-- **Direct Apple Calendar Integration**: Adds games via AppleScript—no `.ics` file importing required.
+- **Automated Login**: Logs into your `nyurban.com` account via Playwright.
+- **Latest Season Detection**: Automatically finds your teams for the most recent season.
+- **Upcoming Games Only**: Filters out games that have already occurred (evaluated in `America/New_York` time).
+- **Deduplication & In-Place Updates**: Assigns each game a deterministic `UID` based on `team + season + table row`, so re-running never duplicates games and updates events in place if a time, gym, or opponent changes. Also checks existing events by summary + start time so previously added local events are not duplicated.
+- **iCloud CalDAV & Local AppleScript Support**: Syncs directly to your iCloud Apple Calendar from GitHub Actions or any OS using CalDAV, with a local macOS AppleScript fallback.
 - **Address Mapping**: Converts gym codes (like `SOA`, `LAG-N`, `JJC-A`) into full physical addresses.
-- **Preview Mode**: Shows you a table of games and asks for confirmation before adding them to your calendar.
 
 ## Prerequisites
 
-- **macOS**: Required for Apple Calendar (iCal) integration via AppleScript.
-- **Python 3.12+**: The core language used for the script.
+- **Python 3.12+**
+- **Apple Calendar via iCloud** (for GitHub Actions / CalDAV sync) or **macOS** (for local AppleScript fallback)
 
-## Setup
+## Local Setup
 
-1. **Clone the repository**:
+1. **Install Dependencies**:
    ```bash
-   git clone https://github.com/yourusername/ny-urban-calendar-sync.git
-   cd ny-urban-calendar-sync
-   ```
-
-2. **Install Dependencies**:
-   ```bash
-   # Create a virtual environment
    python3 -m venv venv
    source venv/bin/activate
-
-   # Install required packages
    pip install -r requirements.txt
-
-   # Install Playwright browser
    playwright install chromium
    ```
 
-3. **Configure Environment Variables**:
-   Copy the example environment file and fill in your details:
+2. **Configure Environment Variables**:
    ```bash
    cp .env.example .env
    ```
-   Edit `.env` and provide:
-   - `NY_URBAN_USERNAME`: Your login email/username.
-   - `NY_URBAN_PASSWORD`: Your login password.
-   - `CALENDAR_NAME`: The name of your target Apple Calendar (e.g., "Work", "Home").
+   Fill in `.env`:
+   - `NY_URBAN_USERNAME`: Your NY Urban login email/username.
+   - `NY_URBAN_PASSWORD`: Your NY Urban login password.
+   - `CALENDAR_NAME`: Name of your target Apple Calendar (e.g., `Em + Kev`).
+   - `ICLOUD_USERNAME` *(for iCloud CalDAV)*: Your Apple ID email.
+   - `ICLOUD_APP_PASSWORD` *(for iCloud CalDAV)*: An Apple [App-Specific Password](https://account.apple.com) (`Sign-In and Security → App-Specific Passwords`).
 
 ## Usage
 
-Run the main script:
 ```bash
+# Interactive sync (auto-uses iCloud CalDAV if configured, else AppleScript on macOS)
 python3 main.py
+
+# Preview changes without modifying your calendar
+python3 main.py --dry-run
+
+# Non-interactive sync (e.g., CI / cron) with optional calendar override
+python3 main.py --yes --calendar "Em + Kev"
 ```
 
-1. The script will log in and detect your latest season.
-2. It will display a table of upcoming games for review.
-3. Type `y` and press `Enter` to sync them to your Apple Calendar.
+## Periodic Sync with GitHub Actions
+
+This repo includes [`.github/workflows/sync-schedule.yml`](.github/workflows/sync-schedule.yml), which runs daily at **13:00 UTC** (8:00 AM EST / 9:00 AM EDT) and can also be triggered manually via **Actions → Sync NY Urban Volleyball Schedule → Run workflow** (including a `dry_run` toggle and `calendar_name` override).
+
+### GitHub Repository Configuration
+
+Go to your GitHub repo **Settings → Secrets and variables → Actions**:
+
+1. **Repository Secrets** (required):
+   - `NY_URBAN_USERNAME`
+   - `NY_URBAN_PASSWORD`
+   - `ICLOUD_USERNAME` (your Apple ID email)
+   - `ICLOUD_APP_PASSWORD` (generated at `account.apple.com → Sign-In and Security → App-Specific Passwords`)
+
+2. **Repository Variables** (optional, easy to change anytime):
+   - `CALENDAR_NAME` — set to your target Apple Calendar name (defaults to `Em + Kev` if unset).
 
 ## Cleanup
 
-If you ever need to remove the synced events from your calendar, you can run:
-```bash
-python3 cleanup_calendar.py
-```
-This will delete any events in your specified calendar that start with "Volleyball vs" or your team names.
+If you ever need to remove synced events locally on macOS, see `cleanup_calendar.py`.
 
 ## Security Note
 
-- **Never** commit your `.env` file to GitHub. It contains your plain-text password.
-- The script uses Playwright in headless mode by default.
+- **Never** commit your `.env` file to GitHub.
+- Always use an **App-Specific Password** (never your primary Apple ID password) for `ICLOUD_APP_PASSWORD`.

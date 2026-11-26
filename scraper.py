@@ -31,6 +31,13 @@ class Game:
     uid: str = ""
 
 
+@dataclass
+class ScheduleResult:
+    season: str
+    teams: list[str]
+    games: list[Game]
+
+
 def parse_schedule_table(html, team_name, season=""):
     soup = BeautifulSoup(html, 'html.parser')
     games = []
@@ -83,7 +90,7 @@ def parse_schedule_table(html, team_name, season=""):
                     games.append(game)
     return games
 
-def login_and_get_schedule():
+def login_and_get_schedule_details() -> ScheduleResult:
     username = os.getenv("NY_URBAN_USERNAME")
     password = os.getenv("NY_URBAN_PASSWORD")
     
@@ -148,7 +155,7 @@ def login_and_get_schedule():
             
             if not teams:
                 print("No teams found in listing.")
-                return []
+                return ScheduleResult(season="", teams=[], games=[])
                 
             # Determine latest season (heuristic: the one at the top is usually latest)
             # or we can just pick the first unique season name we see
@@ -157,7 +164,8 @@ def login_and_get_schedule():
             
             # Filter teams for only the latest season
             latest_teams = [t for t in teams if t['season'] == latest_season]
-            print(f"Found {len(latest_teams)} teams for {latest_season}: {[t['name'] for t in latest_teams]}")
+            team_names = [t['name'] for t in latest_teams]
+            print(f"Found {len(latest_teams)} teams for {latest_season}: {team_names}")
             
             all_games = []
             # Visit each latest team page and parse the table
@@ -186,7 +194,11 @@ def login_and_get_schedule():
                 seen_keys.add(key)
                 seen_uids.add(g.uid)
                 
-        return unique_games
+        return ScheduleResult(season=latest_season, teams=team_names, games=unique_games)
+
+
+def login_and_get_schedule():
+    return login_and_get_schedule_details().games
 
 if __name__ == "__main__":
     login_and_get_schedule()

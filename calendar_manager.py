@@ -166,32 +166,93 @@ def _event_needs_update(
     return False
 
 
+def _is_nyurban_uid(uid: str) -> bool:
+    return uid.startswith("nyurban-") and uid.endswith("@urban-scraper")
+
+
+def _extract_event_season(comp) -> str | None:
+    desc = str(comp.get("description", ""))
+    for line in desc.splitlines():
+        if line.strip().lower().startswith("season:"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def _is_managed_nyurban_event(
+    comp,
+    scraped_season: str | None = None,
+    scraped_teams: list[str] | None = None,
+) -> bool:
+    """
+    Determines whether an existing calendar event is a NY Urban event within the
+    scope of the current scrape (and thus safe to remove if no longer on the site).
+
+    - Events created by this scraper (nyurban-*@urban-scraper UID) are matched
+      unless their description explicitly tags a *different* season (protects
+      remaining games of a prior season when a new season opens).
+    - Legacy events (e.g. added via local AppleScript without our UID) are only
+      matched if their summary begins with "<scraped_team> vs ".
+    """
+    uid = str(comp.get("uid", "")).strip()
+    if _is_nyurban_uid(uid):
+        event_season = _extract_event_season(comp)
+        if scraped_season and event_season and event_season.lower() != scraped_season.strip().lower():
+            return False
+        return True
+
+    summary_lower = str(comp.get("summary", "")).strip().lower()
+    if scraped_teams and summary_lower:
+        for team in scraped_teams:
+            prefix = f"{team.strip().lower()} vs "
+            if team.strip() and summary_lower.startswith(prefix):
+                return True
+
+    return False
+
+
 def sync_events_to_calendar(
     calendar,
     events: list[dict],
     dry_run: bool = False,
+    now: datetime | None = None,
+    scraped_season: str | None = None,
+    scraped_teams: list[str] | None = None,
+    prune_stale: bool = True,
 ) -> dict:
     """
-    Syncs a list of game event dicts to a CalDAV calendar with deduplication and in-place updates.
+    Syncs a list of game event dicts to a CalDAV calendar with deduplication,
+    in-place updates, and removal of future NY Urban events that are no longer
+    on the NY Urban schedule (cancelled or rescheduled).
 
     Each event dict should contain:
         uid, summary, location, start_time, end_time, and optional description.
     """
-    stats = {"added": 0, "updated": 0, "skipped": 0, "failed": 0}
-    if not events:
+    stats = {"added": 0, "updated": 0, "skipped": 0, "deleted": 0, "failed": 0}
+    now_utc = _to_utc_datetime(now) if now is not None else datetime.now(timezone.utc)
+
+    # Safety guard: if we have neither upcoming events nor any scraped teams, don't touch the calendar
+    if not events and not (prune_stale and scraped_teams):
         return stats
 
-    min_start = min(_to_utc_datetime(e["start_time"]) for e in events) - timedelta(days=30)
-    max_end = max(_to_utc_datetime(e["end_time"]) for e in events) + timedelta(days=30)
+    if events:
+        min_event_start = min(_to_utc_datetime(e["start_time"]) for e in events)
+        max_event_end = max(_to_utc_datetime(e["end_time"]) for e in events)
+        search_start = min(now_utc, min_event_start) - timedelta(days=30)
+        search_end = max(now_utc + timedelta(days=365), max_event_end + timedelta(days=30))
+    else:
+        search_start = now_utc - timedelta(days=30)
+        search_end = now_utc + timedelta(days=365)
 
     try:
-        existing_events = calendar.search(start=min_start, end=max_end, event=True)
+        existing_events = calendar.search(start=search_start, end=search_end, event=True)
     except Exception as e:
         print(f"Warning: time-range search failed ({e}); falling back to fetching all events.")
         existing_events = calendar.events()
 
     by_uid, by_summary_start = _index_existing_events(existing_events)
-    print(f"Loaded {len(existing_events)} existing calendar event(s) for deduplication.")
+    print(f"Loaded {len(existing_events)} existing calendar event(s) for deduplication and verification.")
+
+    matched_existing_ids = set()
 
     for event in events:
         uid = event["uid"]
@@ -205,6 +266,7 @@ def sync_events_to_calendar(
         try:
             if uid in by_uid:
                 existing_ev = by_uid[uid]
+                matched_existing_ids.add(id(existing_ev))
                 comp = existing_ev.icalendar_component
                 if not _event_needs_update(comp, summary, full_location, start_utc, end_utc):
                     print(f"Skipped (already synced): {summary} ({event['start_time'].strftime('%a %m/%d %I:%M %p')})")
@@ -233,6 +295,7 @@ def sync_events_to_calendar(
 
             fallback_key = (summary.strip().lower(), _normalize_minute(start_utc))
             if fallback_key in by_summary_start:
+                matched_existing_ids.add(id(by_summary_start[fallback_key]))
                 print(f"Skipped (matching event already exists): {summary} ({event['start_time'].strftime('%a %m/%d %I:%M %p')})")
                 stats["skipped"] += 1
                 continue
@@ -257,6 +320,48 @@ def sync_events_to_calendar(
             print(f"Error syncing event '{summary}' (uid={uid}): {e}")
             stats["failed"] += 1
 
+    # Remove future NY Urban events on the calendar that are no longer on the NY Urban website
+    if prune_stale and (scraped_teams or events):
+        for existing_ev in existing_events:
+            if id(existing_ev) in matched_existing_ids:
+                continue
+
+            try:
+                comp = existing_ev.icalendar_component
+            except Exception:
+                continue
+            if comp is None:
+                continue
+
+            dtstart_prop = comp.get("dtstart")
+            if dtstart_prop is None:
+                continue
+            dtstart_utc = _to_utc_datetime(dtstart_prop.dt)
+            if dtstart_utc is None or dtstart_utc <= now_utc:
+                # Ignore all-day events and games that have already occurred
+                continue
+
+            if not _is_managed_nyurban_event(
+                comp,
+                scraped_season=scraped_season,
+                scraped_teams=scraped_teams,
+            ):
+                continue
+
+            summary = str(comp.get("summary", "(no summary)"))
+            start_label = dtstart_utc.astimezone(NY_TZ).strftime("%a %m/%d %I:%M %p")
+            try:
+                if dry_run:
+                    print(f"[DRY RUN] Would delete (no longer on schedule): {summary} ({start_label})")
+                    stats["deleted"] += 1
+                else:
+                    existing_ev.delete()
+                    print(f"Deleted (no longer on schedule): {summary} ({start_label})")
+                    stats["deleted"] += 1
+            except Exception as e:
+                print(f"Error deleting stale event '{summary}': {e}")
+                stats["failed"] += 1
+
     return stats
 
 
@@ -267,6 +372,10 @@ def sync_events_to_icloud(
     password: str | None = None,
     caldav_url: str | None = None,
     dry_run: bool = False,
+    now: datetime | None = None,
+    scraped_season: str | None = None,
+    scraped_teams: list[str] | None = None,
+    prune_stale: bool = True,
 ) -> dict:
     """Connects to iCloud CalDAV and syncs events into the configured Apple Calendar."""
     username = username or os.getenv("ICLOUD_USERNAME")
@@ -288,7 +397,15 @@ def sync_events_to_icloud(
         principal = client.principal()
         calendar = _find_calendar(principal, calendar_name)
         print(f"Connected to iCloud calendar: {calendar.name}")
-        return sync_events_to_calendar(calendar, events, dry_run=dry_run)
+        return sync_events_to_calendar(
+            calendar,
+            events,
+            dry_run=dry_run,
+            now=now,
+            scraped_season=scraped_season,
+            scraped_teams=scraped_teams,
+            prune_stale=prune_stale,
+        )
 
 
 def _escape_applescript_str(value: str) -> str:

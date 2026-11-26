@@ -12,12 +12,14 @@ NY_TZ = ZoneInfo("America/New_York")
 
 
 class FakeCalDAVEvent:
-    """Minimal stand-in for caldav.Event that mimics _data / icalendar_instance behavior."""
+    """Minimal stand-in for caldav.Event that mimics _data / icalendar_instance / delete behavior."""
 
-    def __init__(self, ical_bytes: bytes):
+    def __init__(self, ical_bytes: bytes, parent_calendar=None):
         self._data = ical_bytes.decode("utf-8") if isinstance(ical_bytes, bytes) else ical_bytes
         self._icalendar_instance = None
+        self._parent_calendar = parent_calendar
         self.save_count = 0
+        self.deleted = False
 
     @property
     def icalendar_instance(self):
@@ -40,11 +42,19 @@ class FakeCalDAVEvent:
             self._data = self._icalendar_instance.to_ical().decode("utf-8")
         return self
 
+    def delete(self):
+        self.deleted = True
+        if self._parent_calendar is not None and self in self._parent_calendar.stored_events:
+            self._parent_calendar.stored_events.remove(self)
+
 
 class FakeCalDAVCalendar:
     def __init__(self, initial_events=None):
         self.name = "Em + Kev"
-        self.stored_events = list(initial_events or [])
+        self.stored_events = []
+        for ev in (initial_events or []):
+            ev._parent_calendar = self
+            self.stored_events.append(ev)
         self.save_event_calls = 0
 
     def search(self, start=None, end=None, event=True):
@@ -55,7 +65,7 @@ class FakeCalDAVCalendar:
 
     def save_event(self, ical_bytes):
         self.save_event_calls += 1
-        ev = FakeCalDAVEvent(ical_bytes)
+        ev = FakeCalDAVEvent(ical_bytes, parent_calendar=self)
         self.stored_events.append(ev)
         return ev
 
@@ -160,13 +170,20 @@ class TestCalDAVSyncDedupe(unittest.TestCase):
         ]
 
         # Run 1: dry run should NOT write anything
-        dry_stats = sync_events_to_calendar(fake_cal, payloads, dry_run=True)
-        self.assertEqual(dry_stats, {"added": 1, "updated": 0, "skipped": 1, "failed": 0})
+        now_ny = datetime(2026, 11, 26, 14, 0, tzinfo=NY_TZ)
+        dry_stats = sync_events_to_calendar(
+            fake_cal, payloads, dry_run=True, now=now_ny,
+            scraped_season="Fall Volleyball 2026", scraped_teams=["Freaks in the Seams"],
+        )
+        self.assertEqual(dry_stats, {"added": 1, "updated": 0, "skipped": 1, "deleted": 0, "failed": 0})
         self.assertEqual(fake_cal.save_event_calls, 0)
 
         # Run 2: real run adds row3, skips row4 (matched legacy AppleScript event)
-        stats1 = sync_events_to_calendar(fake_cal, payloads, dry_run=False)
-        self.assertEqual(stats1, {"added": 1, "updated": 0, "skipped": 1, "failed": 0})
+        stats1 = sync_events_to_calendar(
+            fake_cal, payloads, dry_run=False, now=now_ny,
+            scraped_season="Fall Volleyball 2026", scraped_teams=["Freaks in the Seams"],
+        )
+        self.assertEqual(stats1, {"added": 1, "updated": 0, "skipped": 1, "deleted": 0, "failed": 0})
         self.assertEqual(len(fake_cal.stored_events), 2)
 
         # Attach a user alarm to the stored event to ensure updates preserve user reminders
@@ -179,8 +196,11 @@ class TestCalDAVSyncDedupe(unittest.TestCase):
         stored_row3.save()
 
         # Run 3: re-running with identical data skips both events
-        stats2 = sync_events_to_calendar(fake_cal, payloads, dry_run=False)
-        self.assertEqual(stats2, {"added": 0, "updated": 0, "skipped": 2, "failed": 0})
+        stats2 = sync_events_to_calendar(
+            fake_cal, payloads, dry_run=False, now=now_ny,
+            scraped_season="Fall Volleyball 2026", scraped_teams=["Freaks in the Seams"],
+        )
+        self.assertEqual(stats2, {"added": 0, "updated": 0, "skipped": 2, "deleted": 0, "failed": 0})
 
         # Run 4: game on row3 is rescheduled to 8:30 PM at BEC-F (same UID!)
         rescheduled_start = datetime(2026, 12, 3, 20, 30, tzinfo=NY_TZ)
@@ -188,8 +208,11 @@ class TestCalDAVSyncDedupe(unittest.TestCase):
             self._make_payload("nyurban-row3@urban-scraper", "Freaks in the Seams vs Spikers", "BEC-F", rescheduled_start),
             self._make_payload("nyurban-row4@urban-scraper", "Freaks in the Seams vs Block Party", "JJC-A", legacy_start),
         ]
-        stats3 = sync_events_to_calendar(fake_cal, payloads_updated, dry_run=False)
-        self.assertEqual(stats3, {"added": 0, "updated": 1, "skipped": 1, "failed": 0})
+        stats3 = sync_events_to_calendar(
+            fake_cal, payloads_updated, dry_run=False, now=now_ny,
+            scraped_season="Fall Volleyball 2026", scraped_teams=["Freaks in the Seams"],
+        )
+        self.assertEqual(stats3, {"added": 0, "updated": 1, "skipped": 1, "deleted": 0, "failed": 0})
         self.assertEqual(len(fake_cal.stored_events), 2)
 
         # Verify serialized iCalendar reflects the updated time & location and kept the VALARM
@@ -198,6 +221,148 @@ class TestCalDAVSyncDedupe(unittest.TestCase):
         self.assertEqual(str(updated_vevent.get("location")), "522 W 44th St, New York, NY")
         self.assertEqual(updated_vevent.get("dtstart").dt, rescheduled_start.astimezone(timezone.utc))
         self.assertEqual(len(updated_vevent.walk("VALARM")), 1)
+
+    def test_prune_cancelled_and_rescheduled_future_events(self):
+        now_ny = datetime(2026, 11, 26, 14, 0, tzinfo=NY_TZ)
+
+        # 1. Active future NY Urban event (still on website -> KEEP)
+        active_start = datetime(2026, 12, 3, 19, 30, tzinfo=NY_TZ)
+        active_ev = FakeCalDAVEvent(build_ical_event(
+            uid="nyurban-active@urban-scraper",
+            summary="Freaks in the Seams vs Spikers",
+            location="100 Amsterdam Ave, New York, NY",
+            start_time=active_start,
+            end_time=active_start + timedelta(minutes=75),
+            description="Season: Fall Volleyball 2026\nTeam: Freaks in the Seams",
+        ))
+
+        # 2. Cancelled future NY Urban event from same season (no longer on website -> DELETE)
+        cancelled_start = datetime(2026, 12, 10, 20, 15, tzinfo=NY_TZ)
+        cancelled_ev = FakeCalDAVEvent(build_ical_event(
+            uid="nyurban-cancelled@urban-scraper",
+            summary="Freaks in the Seams vs Ghost Team",
+            location="524 W 59th St, New York, NY",
+            start_time=cancelled_start,
+            end_time=cancelled_start + timedelta(minutes=75),
+            description="Season: Fall Volleyball 2026\nTeam: Freaks in the Seams",
+        ))
+
+        # 3. Cancelled future legacy AppleScript event for a scraped team -> DELETE
+        legacy_cancelled_start = datetime(2026, 12, 17, 19, 0, tzinfo=NY_TZ)
+        legacy_cancelled_ev = FakeCalDAVEvent(build_ical_event(
+            uid="APPLE-LEGACY-UUID-1234",
+            summary="neugenes vs Cancelled Opponents",
+            location="522 W 44th St, New York, NY",
+            start_time=legacy_cancelled_start,
+            end_time=legacy_cancelled_start + timedelta(minutes=75),
+        ))
+
+        # 4. Past NY Urban event (already occurred -> KEEP)
+        past_start = datetime(2026, 11, 19, 19, 0, tzinfo=NY_TZ)
+        past_ev = FakeCalDAVEvent(build_ical_event(
+            uid="nyurban-past@urban-scraper",
+            summary="Freaks in the Seams vs Past Team",
+            location="522 W 44th St, New York, NY",
+            start_time=past_start,
+            end_time=past_start + timedelta(minutes=75),
+            description="Season: Fall Volleyball 2026\nTeam: Freaks in the Seams",
+        ))
+
+        # 5. Future personal (non-NY-Urban) event -> KEEP
+        dinner_start = datetime(2026, 12, 5, 19, 0, tzinfo=NY_TZ)
+        personal_ev = FakeCalDAVEvent(build_ical_event(
+            uid="APPLE-PERSONAL-DINNER",
+            summary="Dinner with Em",
+            location="Brooklyn, NY",
+            start_time=dinner_start,
+            end_time=dinner_start + timedelta(hours=2),
+        ))
+
+        # 6. Future NY Urban event from a DIFFERENT season -> KEEP
+        other_season_start = datetime(2027, 1, 14, 19, 0, tzinfo=NY_TZ)
+        other_season_ev = FakeCalDAVEvent(build_ical_event(
+            uid="nyurban-otherseason@urban-scraper",
+            summary="Freaks in the Seams vs Winter Team",
+            location="522 W 44th St, New York, NY",
+            start_time=other_season_start,
+            end_time=other_season_start + timedelta(minutes=75),
+            description="Season: Winter Volleyball 2027\nTeam: Freaks in the Seams",
+        ))
+
+        fake_cal = FakeCalDAVCalendar(initial_events=[
+            active_ev,
+            cancelled_ev,
+            legacy_cancelled_ev,
+            past_ev,
+            personal_ev,
+            other_season_ev,
+        ])
+
+        scraped_payloads = [
+            self._make_payload(
+                "nyurban-active@urban-scraper",
+                "Freaks in the Seams vs Spikers",
+                "LAG-N",
+                active_start,
+                description="Season: Fall Volleyball 2026\nTeam: Freaks in the Seams",
+            )
+        ]
+
+        # Dry run identifies the 2 stale events without deleting anything
+        dry_stats = sync_events_to_calendar(
+            fake_cal,
+            scraped_payloads,
+            dry_run=True,
+            now=now_ny,
+            scraped_season="Fall Volleyball 2026",
+            scraped_teams=["Freaks in the Seams", "neugenes"],
+        )
+        self.assertEqual(dry_stats, {"added": 0, "updated": 0, "skipped": 1, "deleted": 2, "failed": 0})
+        self.assertEqual(len(fake_cal.stored_events), 6)
+
+        # Real run deletes only the 2 cancelled future NY Urban events
+        real_stats = sync_events_to_calendar(
+            fake_cal,
+            scraped_payloads,
+            dry_run=False,
+            now=now_ny,
+            scraped_season="Fall Volleyball 2026",
+            scraped_teams=["Freaks in the Seams", "neugenes"],
+        )
+        self.assertEqual(real_stats, {"added": 0, "updated": 0, "skipped": 1, "deleted": 2, "failed": 0})
+        self.assertTrue(cancelled_ev.deleted)
+        self.assertTrue(legacy_cancelled_ev.deleted)
+        self.assertFalse(active_ev.deleted)
+        self.assertFalse(past_ev.deleted)
+        self.assertFalse(personal_ev.deleted)
+        self.assertFalse(other_season_ev.deleted)
+        self.assertEqual(len(fake_cal.stored_events), 4)
+
+    def test_prune_when_last_upcoming_game_cancelled(self):
+        now_ny = datetime(2026, 11, 26, 14, 0, tzinfo=NY_TZ)
+        cancelled_start = datetime(2026, 12, 10, 20, 15, tzinfo=NY_TZ)
+        cancelled_ev = FakeCalDAVEvent(build_ical_event(
+            uid="nyurban-lastgame@urban-scraper",
+            summary="Freaks in the Seams vs Final Opponent",
+            location="524 W 59th St, New York, NY",
+            start_time=cancelled_start,
+            end_time=cancelled_start + timedelta(minutes=75),
+            description="Season: Fall Volleyball 2026\nTeam: Freaks in the Seams",
+        ))
+        fake_cal = FakeCalDAVCalendar(initial_events=[cancelled_ev])
+
+        # 0 upcoming games left, but teams were successfully scraped
+        stats = sync_events_to_calendar(
+            fake_cal,
+            events=[],
+            dry_run=False,
+            now=now_ny,
+            scraped_season="Fall Volleyball 2026",
+            scraped_teams=["Freaks in the Seams"],
+        )
+        self.assertEqual(stats, {"added": 0, "updated": 0, "skipped": 0, "deleted": 1, "failed": 0})
+        self.assertTrue(cancelled_ev.deleted)
+        self.assertEqual(len(fake_cal.stored_events), 0)
 
 
 if __name__ == "__main__":

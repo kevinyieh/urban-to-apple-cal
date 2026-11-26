@@ -11,7 +11,7 @@ from calendar_manager import (
     create_apple_calendar_event,
     sync_events_to_icloud,
 )
-from scraper import login_and_get_schedule
+from scraper import login_and_get_schedule_details
 
 load_dotenv()
 
@@ -144,35 +144,35 @@ def main():
 
     print("Starting NY Urban Volleyball Scraper...")
     try:
-        games = login_and_get_schedule()
+        schedule = login_and_get_schedule_details()
     except Exception as e:
         print(f"Scraper failed: {e}", file=sys.stderr)
         sys.exit(1)
 
-    if not games:
-        print("No games found for the latest season.")
+    games = schedule.games
+    if not schedule.teams:
+        print("No teams found for the latest season.")
         return
 
-    upcoming, past_count, unparsed_count = filter_upcoming_games(games)
+    now_ny = datetime.now(NY_TZ)
+    upcoming, past_count, unparsed_count = filter_upcoming_games(games, now=now_ny)
     print(
         f"\nFiltered {len(games)} scraped game(s): "
         f"{len(upcoming)} upcoming, {past_count} already occurred, {unparsed_count} unparsed."
     )
 
-    if not upcoming:
-        print("No upcoming games to sync.")
-        return
-
-    print("\nUpcoming games for the latest season:")
-    print(f"{'Date':<15} | {'Time':<10} | {'Team':<20} | {'Location':<15} | {'Opponent'}")
-    print("-" * 90)
-    for game, _, _ in upcoming:
-        print(
-            f"{game.date:<15} | {game.time:<10} | {game.team_name:<20} | "
-            f"{game.location:<15} | {game.opponent}"
-        )
-
-    print(f"\nTotal upcoming games: {len(upcoming)}")
+    if upcoming:
+        print("\nUpcoming games for the latest season:")
+        print(f"{'Date':<15} | {'Time':<10} | {'Team':<20} | {'Location':<15} | {'Opponent'}")
+        print("-" * 90)
+        for game, _, _ in upcoming:
+            print(
+                f"{game.date:<15} | {game.time:<10} | {game.team_name:<20} | "
+                f"{game.location:<15} | {game.opponent}"
+            )
+        print(f"\nTotal upcoming games: {len(upcoming)}")
+    else:
+        print("\nNo upcoming games found on the website; will still check calendar for cancelled games.")
 
     calendar_name = (args.calendar or os.getenv("CALENDAR_NAME") or "Calendar").strip()
     try:
@@ -180,6 +180,10 @@ def main():
     except Exception as e:
         print(f"Configuration error: {e}", file=sys.stderr)
         sys.exit(1)
+
+    if not upcoming and backend != "icloud":
+        print("No upcoming games to sync.")
+        return
 
     if not args.yes and not args.dry_run:
         confirm = input(
@@ -214,12 +218,15 @@ def main():
                 events=event_payloads,
                 calendar_name=calendar_name,
                 dry_run=args.dry_run,
+                now=now_ny,
+                scraped_season=schedule.season,
+                scraped_teams=schedule.teams,
             )
         except Exception as e:
             print(f"iCloud CalDAV sync failed: {e}", file=sys.stderr)
             sys.exit(1)
     else:
-        stats = {"added": 0, "updated": 0, "skipped": 0, "failed": 0}
+        stats = {"added": 0, "updated": 0, "skipped": 0, "deleted": 0, "failed": 0}
         for payload in event_payloads:
             result = create_apple_calendar_event(
                 summary=payload["summary"],
@@ -235,7 +242,8 @@ def main():
     print(
         f"\n{prefix}Finished! "
         f"Added: {stats['added']}, Updated: {stats['updated']}, "
-        f"Skipped: {stats['skipped']}, Failed: {stats['failed']}."
+        f"Skipped: {stats['skipped']}, Deleted: {stats.get('deleted', 0)}, "
+        f"Failed: {stats['failed']}."
     )
 
     if stats["failed"] > 0:

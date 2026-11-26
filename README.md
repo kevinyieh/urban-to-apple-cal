@@ -7,7 +7,7 @@ Sync your NY Urban volleyball schedule directly to your Apple Calendar with phys
 - **Automated Login**: Logs into your `nyurban.com` account via Playwright.
 - **Latest Season Detection**: Automatically finds your teams for the most recent season.
 - **Upcoming Games Only**: Filters out games that have already occurred (evaluated in `America/New_York` time).
-- **Deduplication & In-Place Updates**: Assigns each game a deterministic `UID` based on `team + season + table row`, so re-running never duplicates games and updates events in place if a time, gym, or opponent changes. Also checks existing events by summary + start time so previously added local events are not duplicated.
+- **Deduplication, Updates & Cancellation Cleanup**: Assigns each game a deterministic `UID` based on `team + season + table row`, so re-running never duplicates games and updates events in place if a time, gym, or opponent changes. Also scans future NY Urban events on your calendar and removes any that are no longer on the NY Urban website (cancelled or rescheduled), while leaving past games, other seasons, and personal events untouched.
 - **iCloud CalDAV & Local AppleScript Support**: Syncs directly to your iCloud Apple Calendar from GitHub Actions or any OS using CalDAV, with a local macOS AppleScript fallback.
 - **Address Mapping**: Converts gym codes (like `SOA`, `LAG-N`, `JJC-A`) into full physical addresses.
 
